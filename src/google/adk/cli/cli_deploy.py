@@ -36,7 +36,12 @@ _AGENT_ENGINE_REQUIREMENT: Final[str] = (
 def _sanitize_temp_folder_name(folder_name: str) -> str:
   if not folder_name:
     return folder_name
-  return folder_name.replace('-', '_')
+  sanitized = ''.join(
+      char if char.isalnum() or char == '_' else '_' for char in folder_name
+  )
+  if sanitized and sanitized[0].isdigit():
+    return '_' + sanitized
+  return sanitized
 
 
 def _ensure_agent_engine_dependency(requirements_txt_path: str) -> None:
