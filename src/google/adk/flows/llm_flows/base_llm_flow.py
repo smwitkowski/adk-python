@@ -692,8 +692,19 @@ class BaseLlmFlow(ABC):
       else:
         return invocation_context.agent.name
 
+    # Track whether the model has produced spoken/text content across
+    # receive() cycles. After the first content-bearing cycle, re-entering
+    # the while-True loop is only valid if a function response was sent
+    # back to the model (the model needs to process the tool result).
+    # Without this guard, orphaned function responses from fire-and-forget
+    # tool calls land in the next receive() cycle as fresh input, causing
+    # the model to generate a complete duplicate response.
+    _has_yielded_content = False
+
     try:
       while True:
+        _cycle_had_function_response = False
+
         async with Aclosing(llm_connection.receive()) as agen:
           async for llm_response in agen:
             if llm_response.live_session_resumption_update:
@@ -738,7 +749,30 @@ class BaseLlmFlow(ABC):
                       invocation_context, audio_blob, cache_type='output'
                   )
 
+                # Track content and function responses for loop
+                # control. Content (audio/text) means the model has
+                # spoken. Function responses mean the caller sent a
+                # tool result back and the model may respond to it.
+                if event.content and event.content.parts:
+                  for part in event.content.parts:
+                    if part.inline_data or part.text:
+                      _has_yielded_content = True
+                    if part.function_response:
+                      _cycle_had_function_response = True
+
                 yield event
+
+        # Prevent orphaned re-entry after content delivery.
+        #
+        # If the model has already produced content and this cycle
+        # did NOT process a function response, there is nothing
+        # pending for the model to respond to. Re-entering receive()
+        # would consume any orphaned function response as fresh
+        # input, causing a duplicate response. See:
+        # https://github.com/google/adk-python/issues/4902
+        if _has_yielded_content and not _cycle_had_function_response:
+          break
+
         # Give opportunity for other tasks to run.
         await asyncio.sleep(0)
     except ConnectionClosedOK:

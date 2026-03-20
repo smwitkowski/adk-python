@@ -487,3 +487,238 @@ async def test_handle_after_model_callback_caches_canonical_tools():
     assert result1.grounding_metadata == {'foo': 'bar'}
     assert result2.grounding_metadata == {'foo': 'bar'}
     assert result3.grounding_metadata == {'foo': 'bar'}
+
+
+# ---------------------------------------------------------------------------
+# Tests for _receive_from_model loop control (issue #4902)
+# ---------------------------------------------------------------------------
+
+
+class _MultiCycleMockConnection:
+  """Mock connection that yields different responses per receive() call.
+
+  Each call to receive() returns the next sequence from `cycles`.
+  After all cycles are exhausted, subsequent calls yield nothing.
+  """
+
+  def __init__(self, cycles: list[list[LlmResponse]]):
+    self._cycles = cycles
+    self._call_count = 0
+
+  async def send_history(self, history):
+    pass
+
+  async def send_content(self, content):
+    pass
+
+  async def receive(self):
+    idx = self._call_count
+    self._call_count += 1
+    if idx < len(self._cycles):
+      for resp in self._cycles[idx]:
+        yield resp
+
+
+@pytest.mark.asyncio
+async def test_receive_from_model_breaks_after_content_no_fn_response():
+  """After yielding content, loop should break if no function response.
+
+  This prevents orphaned function responses from triggering duplicate
+  model responses (issue #4902).
+  """
+  flow = BaseLlmFlowForTesting()
+  agent = Agent(name='test_agent', model='mock')
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent,
+      user_content='Hello',
+  )
+
+  # Cycle 1: audio content + turnComplete (model spoke)
+  # Cycle 2: should NOT be reached (loop should break after cycle 1)
+  connection = _MultiCycleMockConnection(
+      cycles=[
+          [
+              LlmResponse(
+                  content=types.Content(
+                      role='model',
+                      parts=[
+                          types.Part(
+                              inline_data=types.Blob(
+                                  data=b'\x00',
+                                  mime_type='audio/pcm',
+                              ),
+                          )
+                      ],
+                  ),
+              ),
+              LlmResponse(turn_complete=True),
+          ],
+          [
+              LlmResponse(
+                  content=types.Content(
+                      role='model',
+                      parts=[types.Part.from_text(text='DUPLICATE')],
+                  ),
+              ),
+              LlmResponse(turn_complete=True),
+          ],
+      ]
+  )
+
+  events = []
+  async for event in flow._receive_from_model(
+      connection,
+      'test',
+      invocation_context,
+      LlmRequest(),
+  ):
+    events.append(event)
+
+  # Should have events from cycle 1 only, not the DUPLICATE from cycle 2
+  texts = [
+      p.text
+      for e in events
+      if e.content and e.content.parts
+      for p in e.content.parts
+      if p.text
+  ]
+  assert 'DUPLICATE' not in texts, (
+      'Loop re-entered after content delivery, producing a duplicate.'
+      ' _receive_from_model should break after yielding content when'
+      ' no function response is pending.'
+  )
+  assert connection._call_count == 1, (
+      f'Expected 1 receive() call, got {connection._call_count}.'
+      ' Loop should break after content + turnComplete.'
+  )
+
+
+@pytest.mark.asyncio
+async def test_receive_from_model_continues_when_fn_response_pending():
+  """Loop should continue if a function response was processed.
+
+  When the model calls a tool and the caller sends the response back,
+  the model is expected to produce a follow-up response. The loop
+  must re-enter receive() to collect it.
+  """
+  flow = BaseLlmFlowForTesting()
+  agent = Agent(name='test_agent', model='mock')
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent,
+      user_content='Hello',
+  )
+
+  # Cycle 1: function response (tool result sent back) + turnComplete
+  # Cycle 2: model speaks in response to tool result + turnComplete
+  connection = _MultiCycleMockConnection(
+      cycles=[
+          [
+              LlmResponse(
+                  content=types.Content(
+                      role='model',
+                      parts=[
+                          types.Part(
+                              function_response=types.FunctionResponse(
+                                  name='my_tool',
+                                  response={'result': 'ok'},
+                              ),
+                          )
+                      ],
+                  ),
+              ),
+              LlmResponse(turn_complete=True),
+          ],
+          [
+              LlmResponse(
+                  content=types.Content(
+                      role='model',
+                      parts=[types.Part.from_text(text='Tool result spoken')],
+                  ),
+              ),
+              LlmResponse(turn_complete=True),
+          ],
+      ]
+  )
+
+  events = []
+  async for event in flow._receive_from_model(
+      connection,
+      'test',
+      invocation_context,
+      LlmRequest(),
+  ):
+    events.append(event)
+
+  texts = [
+      p.text
+      for e in events
+      if e.content and e.content.parts
+      for p in e.content.parts
+      if p.text
+  ]
+  assert 'Tool result spoken' in texts, (
+      'Loop should continue to cycle 2 when a function response was'
+      ' pending in cycle 1.'
+  )
+  assert (
+      connection._call_count == 2
+  ), f'Expected 2 receive() calls, got {connection._call_count}.'
+
+
+@pytest.mark.asyncio
+async def test_receive_from_model_continues_on_empty_cycle():
+  """Loop should continue on empty cycles (NR retry).
+
+  When the model sends turnComplete without any content or function
+  responses, the loop should re-enter to allow implicit retry. This
+  preserves the existing behaviour for the no-response pattern.
+  """
+  flow = BaseLlmFlowForTesting()
+  agent = Agent(name='test_agent', model='mock')
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent,
+      user_content='Hello',
+  )
+
+  # Cycle 1: empty turnComplete (NR pattern)
+  # Cycle 2: model speaks on retry
+  connection = _MultiCycleMockConnection(
+      cycles=[
+          [
+              LlmResponse(turn_complete=True),
+          ],
+          [
+              LlmResponse(
+                  content=types.Content(
+                      role='model',
+                      parts=[types.Part.from_text(text='Retry worked')],
+                  ),
+              ),
+              LlmResponse(turn_complete=True),
+          ],
+      ]
+  )
+
+  events = []
+  async for event in flow._receive_from_model(
+      connection,
+      'test',
+      invocation_context,
+      LlmRequest(),
+  ):
+    events.append(event)
+
+  texts = [
+      p.text
+      for e in events
+      if e.content and e.content.parts
+      for p in e.content.parts
+      if p.text
+  ]
+  assert 'Retry worked' in texts, (
+      'Loop should continue past empty cycle (NR retry) and yield'
+      ' content from cycle 2.'
+  )
+  assert (
+      connection._call_count == 2
+  ), f'Expected 2 receive() calls, got {connection._call_count}.'
